@@ -2,203 +2,340 @@
 #include <BleMouse.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <math.h>
 #include <stdio.h>
 
-// ==========================================
-// ESP32-C3 SUPERMINI SCROLLER V3.6
-// OLED + BLE + SERIAL + BUTTONS
-// NEW: DOUBLE CLICK (r) + STATUS
-// ==========================================
+// =============================================
+// ESP32-C3 SCROLLER V3.8
+// Short / Long Press + OLED Icons + BLE
+// =============================================
 
-// ---------- OLED ----------
+// 1 = Serial input and debug logs ON
+// 0 = Serial completely disabled
+#define DEBUG_MODE 1
+
+#if DEBUG_MODE
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+#else
+  #define DEBUG_PRINT(x) do {} while (0)
+  #define DEBUG_PRINTLN(x) do {} while (0)
+#endif
+
+// OLED - your confirmed working pins
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
-  U8G2_R0,
-  U8X8_PIN_NONE,
+  U8G2_R0, U8X8_PIN_NONE,
   6,  // SCL
   5   // SDA
 );
 
-// ---------- BLUETOOTH ----------
 BleMouse bleMouse("scroller", "Custom IoT", 100);
 
-// ---------- PINS ----------
+// =============================================
+// PIN CONFIGURATION
+// =============================================
 const uint8_t LED_PIN = 8;
-const uint8_t BTN_S = 3;
-const uint8_t BTN_D = 4;
-const uint8_t BTN_X = 7;
-const uint8_t BTN_C = 10;
 
-// Active-low LED
-const uint8_t LED_ON = LOW;
-const uint8_t LED_OFF = HIGH;
+const uint8_t BTN_DOWN = 3;
+const uint8_t BTN_UP   = 4;
+const uint8_t BTN_LIKE = 10;
+const uint8_t BTN_RESERVED = 1;
 
-// ---------- TIMING ----------
+// =============================================
+// SETTINGS
+// =============================================
+const int SHORT_DISTANCE = 100;
+const int LONG_DISTANCE = 150;
+
+const int SHORT_SPEED_MS = 6;
+const int LONG_SPEED_MS = 12;
+
+const unsigned long LONG_PRESS_MS = 500;
 const unsigned long DEBOUNCE_MS = 50;
-const unsigned long BLINK_INTERVAL = 500;
-const unsigned long SERIAL_TIMEOUT = 250;
+const unsigned long ACTION_DISPLAY_MS = 2000;
+const unsigned long BLINK_MS = 500;
+const unsigned long SERIAL_TIMEOUT_MS = 250;
 
-// Double-click timing
-const int CLICK_HOLD_MS = 50;
-const int DOUBLE_CLICK_GAP_MS = 100;
+// OLED placement
+const int ICON_X = 64;
+const int ICON_Y = 39;
+const int TEXT_Y = 56;
 
-// ---------- OLED POSITIONS ----------
-// Tested and confirmed working
-const int TEXT_Y1 = 43;
-const int TEXT_Y2 = 56;
-
-// ---------- SYSTEM STATE ----------
+// =============================================
+// STATE
+// =============================================
 bool autoCalibrate = true;
 bool wasConnected = false;
 
 bool ledState = false;
 unsigned long lastBlink = 0;
 
-// ---------- BUTTON CONFIG ----------
+String lastAction = "None";
+
+enum ScreenType {
+  SCREEN_SEARCHING,
+  SCREEN_READY,
+  SCREEN_LIKE,
+  SCREEN_UP,
+  SCREEN_DOWN,
+  SCREEN_CALIBRATE,
+  SCREEN_STATUS,
+  SCREEN_MOVE,
+  SCREEN_ERROR
+};
+
+ScreenType currentScreen = SCREEN_SEARCHING;
+bool actionScreenActive = false;
+unsigned long actionFinishedAt = 0;
+
+// =============================================
+// BUTTON STRUCTURE
+// =============================================
 struct Button {
   uint8_t pin;
   bool lastRaw;
   bool stableState;
   unsigned long lastChange;
-  int distance;
-  int speed;
-  bool swipeUp;
-  const char* name;
+  unsigned long pressedAt;
+  bool longTriggered;
 };
 
-Button buttons[] = {
-  {BTN_S, HIGH, HIGH, 0, 100, 6, true,  "S"},
-  {BTN_D, HIGH, HIGH, 0, 150, 12, true, "D"},
-  {BTN_X, HIGH, HIGH, 0, 100, 6, false, "X"},
-  {BTN_C, HIGH, HIGH, 0, 150, 12, false, "C"}
+Button downButton = {
+  BTN_DOWN, HIGH, HIGH, 0, 0, false
 };
 
-const int BUTTON_COUNT =
-  sizeof(buttons) / sizeof(buttons[0]);
+Button upButton = {
+  BTN_UP, HIGH, HIGH, 0, 0, false
+};
 
-// ---------- OLED STATE ----------
-String displayLine1 = "Starting";
-String displayLine2 = "Please wait";
-String lastAction = "None";
+Button likeButton = {
+  BTN_LIKE, HIGH, HIGH, 0, 0, false
+};
 
-// ---------- SERIAL INPUT ----------
+Button reservedButton = {
+  BTN_RESERVED, HIGH, HIGH, 0, 0, false
+};
+
+// Serial buffer
 char serialBuffer[64];
 uint8_t serialIndex = 0;
 unsigned long lastSerialTime = 0;
 bool serialOverflow = false;
 
-// ==========================================
-// OLED - CENTERED TWO-LINE DISPLAY
-// ==========================================
-void updateScreen(
-  const String& line1,
-  const String& line2
+// =============================================
+// OLED ICONS
+// =============================================
+void drawBluetoothIcon(int x, int y) {
+  u8g2.drawLine(x, y - 12, x, y + 12);
+  u8g2.drawLine(x, y - 12, x + 7, y - 6);
+  u8g2.drawLine(x + 7, y - 6, x - 7, y + 6);
+  u8g2.drawLine(x - 7, y - 6, x + 7, y + 6);
+  u8g2.drawLine(x + 7, y + 6, x, y + 12);
+}
+
+void drawSmileIcon(int x, int y) {
+  u8g2.drawCircle(x, y, 11);
+
+  u8g2.drawDisc(x - 4, y - 3, 1);
+  u8g2.drawDisc(x + 4, y - 3, 1);
+
+  u8g2.drawLine(x - 5, y + 3, x - 2, y + 6);
+  u8g2.drawLine(x - 2, y + 6, x + 2, y + 6);
+  u8g2.drawLine(x + 2, y + 6, x + 5, y + 3);
+}
+
+void drawHeartIcon(int x, int y) {
+  u8g2.drawDisc(x - 5, y - 3, 5);
+  u8g2.drawDisc(x + 5, y - 3, 5);
+
+  u8g2.drawTriangle(
+    x - 10, y - 1,
+    x + 10, y - 1,
+    x, y + 9
+  );
+}
+
+void drawUpIcon(int x, int y) {
+  u8g2.drawLine(x, y - 11, x, y + 10);
+  u8g2.drawLine(x, y - 11, x - 8, y - 3);
+  u8g2.drawLine(x, y - 11, x + 8, y - 3);
+}
+
+void drawDownIcon(int x, int y) {
+  u8g2.drawLine(x, y - 10, x, y + 10);
+  u8g2.drawLine(x, y + 10, x - 8, y + 2);
+  u8g2.drawLine(x, y + 10, x + 8, y + 2);
+}
+
+void drawGearIcon(int x, int y) {
+  u8g2.drawCircle(x, y, 8);
+  u8g2.drawCircle(x, y, 3);
+
+  for (int i = 0; i < 8; i++) {
+    float a = i * 3.14159265f / 4.0f;
+
+    int x1 = x + cosf(a) * 9;
+    int y1 = y + sinf(a) * 9;
+    int x2 = x + cosf(a) * 12;
+    int y2 = y + sinf(a) * 12;
+
+    u8g2.drawLine(x1, y1, x2, y2);
+  }
+}
+
+void drawCheckIcon(int x, int y) {
+  u8g2.drawCircle(x, y, 11);
+  u8g2.drawLine(x - 6, y, x - 1, y + 5);
+  u8g2.drawLine(x - 1, y + 5, x + 7, y - 6);
+}
+
+void drawMoveIcon(int x, int y) {
+  u8g2.drawLine(x - 10, y, x + 10, y);
+  u8g2.drawLine(x, y - 10, x, y + 10);
+}
+
+void drawErrorIcon(int x, int y) {
+  u8g2.drawCircle(x, y, 11);
+  u8g2.drawLine(x - 5, y - 5, x + 5, y + 5);
+  u8g2.drawLine(x + 5, y - 5, x - 5, y + 5);
+}
+
+// =============================================
+// OLED SCREEN
+// =============================================
+void drawScreen(
+  ScreenType screen,
+  const char* customLabel = nullptr
 ) {
-  displayLine1 = line1;
-  displayLine2 = line2;
+  currentScreen = screen;
+
+  const char* label = "";
 
   u8g2.clearBuffer();
+
+  switch (screen) {
+    case SCREEN_SEARCHING:
+      drawBluetoothIcon(ICON_X, ICON_Y);
+      label = "SEARCHING";
+      break;
+
+    case SCREEN_READY:
+      drawSmileIcon(ICON_X, ICON_Y);
+      label = "READY";
+      break;
+
+    case SCREEN_LIKE:
+      drawHeartIcon(ICON_X, ICON_Y);
+      label = "LIKE!";
+      break;
+
+    case SCREEN_UP:
+      drawUpIcon(ICON_X, ICON_Y);
+      label = "UP";
+      break;
+
+    case SCREEN_DOWN:
+      drawDownIcon(ICON_X, ICON_Y);
+      label = "DOWN";
+      break;
+
+    case SCREEN_CALIBRATE:
+      drawGearIcon(ICON_X, ICON_Y);
+      label = "CALIBRATE";
+      break;
+
+    case SCREEN_STATUS:
+      drawCheckIcon(ICON_X, ICON_Y);
+      label = "STATUS";
+      break;
+
+    case SCREEN_MOVE:
+      drawMoveIcon(ICON_X, ICON_Y);
+      label = "CURSOR";
+      break;
+
+    case SCREEN_ERROR:
+      drawErrorIcon(ICON_X, ICON_Y);
+      label = "ERROR";
+      break;
+  }
+
+  if (customLabel != nullptr) {
+    label = customLabel;
+  }
+
   u8g2.setFont(u8g2_font_5x8_tf);
 
-  int width = u8g2.getDisplayWidth();
-
-  int x1 = (width -
-    u8g2.getStrWidth(line1.c_str())) / 2;
-
-  int x2 = (width -
-    u8g2.getStrWidth(line2.c_str())) / 2;
-
-  u8g2.drawStr(
-    max(0, x1),
-    TEXT_Y1,
-    line1.c_str()
+  int textWidth = u8g2.getStrWidth(label);
+  int x = max(
+    0,
+    (u8g2.getDisplayWidth() - textWidth) / 2
   );
 
-  u8g2.drawStr(
-    max(0, x2),
-    TEXT_Y2,
-    line2.c_str()
-  );
-
+  u8g2.drawStr(x, TEXT_Y, label);
   u8g2.sendBuffer();
 }
 
-// ==========================================
-// BLUETOOTH LED
-// ==========================================
-void updateLED() {
-  if (bleMouse.isConnected()) {
-    ledState = false;
-    digitalWrite(LED_PIN, LED_OFF);
+void showAction(
+  ScreenType screen,
+  const char* label = nullptr
+) {
+  drawScreen(screen, label);
+
+  actionScreenActive = true;
+  actionFinishedAt = millis();
+}
+
+void updateDisplay() {
+  if (!bleMouse.isConnected()) {
+    actionScreenActive = false;
+
+    if (currentScreen != SCREEN_SEARCHING) {
+      drawScreen(SCREEN_SEARCHING);
+    }
+
     return;
   }
 
-  if (millis() - lastBlink >= BLINK_INTERVAL) {
-    lastBlink = millis();
-    ledState = !ledState;
+  if (actionScreenActive &&
+      millis() - actionFinishedAt >= ACTION_DISPLAY_MS) {
 
-    digitalWrite(
-      LED_PIN,
-      ledState ? LED_ON : LED_OFF
-    );
+    actionScreenActive = false;
+    drawScreen(SCREEN_READY);
   }
 }
 
-// ==========================================
-// SERIAL HELP
-// ==========================================
-void printHelp() {
-  Serial.println();
-  Serial.println("================================");
-  Serial.println(" ESP32-C3 SCROLLER V3.6");
-  Serial.println("================================");
+// =============================================
+// LED
+// =============================================
+void updateLED() {
+  if (bleMouse.isConnected()) {
+    ledState = false;
+    digitalWrite(LED_PIN, HIGH);
+    return;
+  }
 
-  Serial.println("SWIPE:");
-  Serial.println(" s -> UP 100, 6ms");
-  Serial.println(" d -> UP 150, 12ms");
-  Serial.println(" x -> DOWN 100, 6ms");
-  Serial.println(" c -> DOWN 150, 12ms");
+  if (millis() - lastBlink >= BLINK_MS) {
+    lastBlink = millis();
+    ledState = !ledState;
 
-  Serial.println();
-  Serial.println("DOUBLE CLICK:");
-  Serial.println(" r -> Double click + calibration");
-
-  Serial.println();
-  Serial.println("CALIBRATION:");
-  Serial.println(" cal -> Standard calibration");
-  Serial.println(" e   -> Edge calibration");
-
-  Serial.println();
-  Serial.println("CUSTOM SWIPE:");
-  Serial.println(" up 120 8");
-  Serial.println(" down 180 10");
-
-  Serial.println();
-  Serial.println("MANUAL CURSOR:");
-  Serial.println(" 100,200");
-  Serial.println(" -100,0");
-
-  Serial.println();
-  Serial.println("SETTINGS:");
-  Serial.println(" auto on");
-  Serial.println(" auto off");
-  Serial.println(" status");
-  Serial.println(" help");
-
-  Serial.println("================================");
+    // Active-low LED
+    digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+  }
 }
 
-// ==========================================
-// CURSOR MOVEMENT
-// ==========================================
+// =============================================
+// BLE CURSOR MOVEMENT
+// =============================================
 bool moveCursor(int x, int y) {
   if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] BLE disconnected");
+    DEBUG_PRINTLN("[ERROR] BLE disconnected");
     return false;
   }
 
   while (x != 0 || y != 0) {
     if (!bleMouse.isConnected()) {
-      Serial.println("[ERROR] BLE connection lost");
+      DEBUG_PRINTLN("[ERROR] BLE connection lost");
       return false;
     }
 
@@ -216,123 +353,85 @@ bool moveCursor(int x, int y) {
   return true;
 }
 
-// ==========================================
-// STANDARD CALIBRATION
-// ==========================================
-void calibrateStandard() {
-  if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] BLE disconnected");
-    return;
+// =============================================
+// CALIBRATION
+// =============================================
+bool calibrateEdge(bool showIcon = true) {
+  if (!bleMouse.isConnected()) return false;
+
+  if (showIcon) {
+    drawScreen(SCREEN_CALIBRATE);
   }
 
-  lastAction = "Standard calibration";
+  DEBUG_PRINTLN("[CAL] Edge calibration");
 
-  Serial.println("[CAL] Standard calibration");
-  updateScreen("Calibrating", "Standard");
-
-  if (!moveCursor(3000, 3000)) {
-    updateScreen("Calibration", "Failed");
-    return;
-  }
+  if (!moveCursor(5000, 5000)) return false;
 
   delay(100);
 
-  if (!moveCursor(-500, -200)) {
-    updateScreen("Calibration", "Failed");
-    return;
-  }
+  if (!moveCursor(0, -100)) return false;
+  if (!moveCursor(0, -70)) return false;
 
-  Serial.println("[CAL] Standard complete");
-  updateScreen("Calibration", "Complete");
-}
-
-// ==========================================
-// EDGE CALIBRATION
-// NO LEFT 1000 MOVEMENT
-// ==========================================
-bool calibrateEdge() {
-  if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] BLE disconnected");
-    return false;
-  }
-
-  Serial.println("[CAL] Edge calibration");
-  updateScreen("Calibrating", "Right edge");
-
-  // Move to bottom-right
-  if (!moveCursor(5000, 5000)) {
-    updateScreen("Calibration", "Failed");
-    return false;
-  }
-
-  delay(100);
-
-  // Move UP 100
-  if (!moveCursor(0, -100)) {
-    updateScreen("Calibration", "Failed");
-    return false;
-  }
-
-  // Move UP another 70
-  if (!moveCursor(0, -70)) {
-    updateScreen("Calibration", "Failed");
-    return false;
-  }
-
-  // No LEFT movement
-
-  Serial.println("[CAL] Edge complete");
-  updateScreen("Calibration", "Complete");
-
+  DEBUG_PRINTLN("[CAL] Complete");
   return true;
 }
 
-// ==========================================
-// SWIPE ENGINE
-// ==========================================
+bool calibrateStandard() {
+  if (!bleMouse.isConnected()) return false;
+
+  drawScreen(SCREEN_CALIBRATE);
+
+  DEBUG_PRINTLN("[CAL] Standard calibration");
+
+  if (!moveCursor(3000, 3000)) return false;
+
+  delay(100);
+
+  if (!moveCursor(-500, -200)) return false;
+
+  DEBUG_PRINTLN("[CAL] Complete");
+  return true;
+}
+
+// =============================================
+// SWIPE
+// =============================================
 void simulateSwipe(
   int distance,
   int speedDelay,
   bool swipeUp,
-  const String& source
+  const String& source,
+  const char* oledLabel = nullptr
 ) {
   if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] Bluetooth not connected");
-    updateScreen("Bluetooth", "Disconnected");
+    DEBUG_PRINTLN("[ERROR] Not connected");
     return;
   }
 
   if (distance < 1 || distance > 2000 ||
       speedDelay < 1 || speedDelay > 100) {
-    Serial.println("[ERROR] Invalid swipe settings");
-    updateScreen("Invalid", "Swipe");
+    DEBUG_PRINTLN("[ERROR] Invalid swipe");
+    showAction(SCREEN_ERROR);
     return;
   }
 
-  String direction = swipeUp ? "UP" : "DOWN";
+  ScreenType icon =
+    swipeUp ? SCREEN_UP : SCREEN_DOWN;
 
-  lastAction = direction + " " + String(distance);
+  const char* label = oledLabel;
 
-  updateScreen(
-    "Swipe " + direction,
-    String(distance) + " units"
-  );
+  if (label == nullptr) {
+    label = swipeUp ? "SWIPE UP" : "SWIPE DOWN";
+  }
 
-  Serial.println();
-  Serial.println("--------- SWIPE ---------");
+  lastAction = String(swipeUp ? "UP " : "DOWN ")
+               + distance
+               + " (" + source + ")";
 
-  Serial.print("Source: ");
-  Serial.println(source);
+  drawScreen(icon, label);
 
-  Serial.print("Direction: ");
-  Serial.println(direction);
-
-  Serial.print("Distance: ");
-  Serial.println(distance);
-
-  Serial.print("Speed delay: ");
-  Serial.print(speedDelay);
-  Serial.println("ms");
+  DEBUG_PRINT("[SWIPE] ");
+  DEBUG_PRINTLN(lastAction);
 
   bleMouse.press(MOUSE_LEFT);
   delay(50);
@@ -342,9 +441,7 @@ void simulateSwipe(
   while (remaining > 0) {
     if (!bleMouse.isConnected()) {
       bleMouse.release(MOUSE_LEFT);
-
-      Serial.println("[ERROR] BLE connection lost");
-      updateScreen("Bluetooth", "Connection lost");
+      DEBUG_PRINTLN("[ERROR] Connection lost");
       return;
     }
 
@@ -362,161 +459,216 @@ void simulateSwipe(
   delay(20);
   bleMouse.release(MOUSE_LEFT);
 
-  Serial.println("[SWIPE] Complete");
-
   delay(100);
 
   if (autoCalibrate && bleMouse.isConnected()) {
-    if (!calibrateEdge()) return;
+    if (!calibrateEdge(false)) return;
   }
 
   if (bleMouse.isConnected()) {
-    updateScreen(lastAction, "Ready");
+    showAction(icon, label);
   }
 
-  Serial.println("[READY] Next command");
-  Serial.println("-------------------------");
+  DEBUG_PRINTLN("[SWIPE] Complete");
 }
 
-// ==========================================
+// =============================================
 // DOUBLE CLICK / LIKE
-// ==========================================
+// =============================================
 void simulateDoubleClick() {
-  if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] Bluetooth not connected");
-    updateScreen("Bluetooth", "Disconnected");
-    return;
-  }
+  if (!bleMouse.isConnected()) return;
 
-  lastAction = "Double click";
+  lastAction = "Double click / Like";
 
-  Serial.println();
-  Serial.println("------- DOUBLE CLICK -------");
-  Serial.println("[ACTION] Double click / Like");
+  drawScreen(SCREEN_LIKE);
 
-  updateScreen("Double click", "Like!");
+  DEBUG_PRINTLN("[LIKE] Double click");
 
-  // First click
   bleMouse.press(MOUSE_LEFT);
-  delay(CLICK_HOLD_MS);
+  delay(50);
   bleMouse.release(MOUSE_LEFT);
 
-  // Gap between clicks
-  delay(DOUBLE_CLICK_GAP_MS);
-
-  if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] BLE disconnected");
-    updateScreen("Bluetooth", "Disconnected");
-    return;
-  }
-
-  // Second click
-  bleMouse.press(MOUSE_LEFT);
-  delay(CLICK_HOLD_MS);
-  bleMouse.release(MOUSE_LEFT);
-
-  Serial.println("[CLICK] Double click complete");
-
-  // Same pause as swipe
   delay(100);
 
-  // Same calibration as swipe
+  if (!bleMouse.isConnected()) return;
+
+  bleMouse.press(MOUSE_LEFT);
+  delay(50);
+  bleMouse.release(MOUSE_LEFT);
+
+  delay(100);
+
   if (autoCalibrate && bleMouse.isConnected()) {
-    if (!calibrateEdge()) return;
+    if (!calibrateEdge(false)) return;
   }
 
   if (bleMouse.isConnected()) {
-    updateScreen("Double click", "Ready");
+    showAction(SCREEN_LIKE);
   }
 
-  Serial.println("[READY] Next command");
-  Serial.println("----------------------------");
+  DEBUG_PRINTLN("[LIKE] Complete");
 }
 
-// ==========================================
-// PHYSICAL BUTTONS
-// ==========================================
-void handleButtons() {
-  for (int i = 0; i < BUTTON_COUNT; i++) {
-    Button& b = buttons[i];
+// =============================================
+// STATUS - OLED + OPTIONAL DEBUG LOG
+// =============================================
+void showStatus() {
+  bool connected = bleMouse.isConnected();
 
-    unsigned long now = millis();
-    bool raw = digitalRead(b.pin);
+  DEBUG_PRINTLN("========== STATUS ==========");
+  DEBUG_PRINT("BLE: ");
+  DEBUG_PRINTLN(connected ? "CONNECTED" : "DISCONNECTED");
 
-    if (raw != b.lastRaw) {
-      b.lastRaw = raw;
-      b.lastChange = now;
-    }
+  DEBUG_PRINT("Auto calibration: ");
+  DEBUG_PRINTLN(autoCalibrate ? "ON" : "OFF");
 
-    if ((now - b.lastChange) >= DEBOUNCE_MS &&
-        raw != b.stableState) {
-      b.stableState = raw;
+  DEBUG_PRINT("Last action: ");
+  DEBUG_PRINTLN(lastAction);
 
-      if (b.stableState == LOW &&
+  DEBUG_PRINTLN("============================");
+
+  if (connected) {
+    showAction(
+      SCREEN_STATUS,
+      autoCalibrate ? "AUTO CAL ON" : "AUTO CAL OFF"
+    );
+  } else {
+    drawScreen(SCREEN_SEARCHING);
+  }
+}
+
+// =============================================
+// BUTTON HANDLING
+// =============================================
+
+// Call once during setup or connection changes
+void syncButton(Button& b) {
+  bool state = digitalRead(b.pin);
+
+  b.lastRaw = state;
+  b.stableState = state;
+  b.lastChange = millis();
+  b.pressedAt = millis();
+  b.longTriggered = false;
+}
+
+void handleSwipeButton(Button& b, bool swipeUp) {
+  unsigned long now = millis();
+  bool raw = digitalRead(b.pin);
+
+  if (raw != b.lastRaw) {
+    b.lastRaw = raw;
+    b.lastChange = now;
+  }
+
+  // Debounced transition
+  if ((now - b.lastChange) >= DEBOUNCE_MS &&
+      raw != b.stableState) {
+
+    b.stableState = raw;
+
+    if (raw == LOW) {
+      // Button pressed
+      b.pressedAt = now;
+      b.longTriggered = false;
+    } else {
+      // Button released
+      if (!b.longTriggered &&
           bleMouse.isConnected()) {
-        Serial.print("[BUTTON] ");
-        Serial.println(b.name);
 
         simulateSwipe(
-          b.distance,
-          b.speed,
-          b.swipeUp,
-          "BTN " + String(b.name)
+          SHORT_DISTANCE,
+          SHORT_SPEED_MS,
+          swipeUp,
+          swipeUp ? "BTN UP SHORT" : "BTN DOWN SHORT",
+          swipeUp ? "UP SHORT" : "DOWN SHORT"
         );
       }
     }
   }
+
+  // Long press fires once while held
+  if (b.stableState == LOW &&
+      !b.longTriggered &&
+      bleMouse.isConnected() &&
+      (millis() - b.pressedAt >= LONG_PRESS_MS)) {
+
+    b.longTriggered = true;
+
+    simulateSwipe(
+      LONG_DISTANCE,
+      LONG_SPEED_MS,
+      swipeUp,
+      swipeUp ? "BTN UP LONG" : "BTN DOWN LONG",
+      swipeUp ? "UP LONG" : "DOWN LONG"
+    );
+  }
 }
 
-// ==========================================
-// STATUS: SERIAL + OLED
-// ==========================================
-void showStatus() {
-  bool connected = bleMouse.isConnected();
+void handleLikeButton(Button& b) {
+  unsigned long now = millis();
+  bool raw = digitalRead(b.pin);
 
+  if (raw != b.lastRaw) {
+    b.lastRaw = raw;
+    b.lastChange = now;
+  }
+
+  if ((now - b.lastChange) >= DEBOUNCE_MS &&
+      raw != b.stableState) {
+
+    b.stableState = raw;
+
+    if (raw == LOW && bleMouse.isConnected()) {
+      simulateDoubleClick();
+    }
+  }
+}
+
+void handleButtons() {
+  handleSwipeButton(downButton, false);
+  handleSwipeButton(upButton, true);
+  handleLikeButton(likeButton);
+
+  // GPIO1 reserved:
+  // No action intentionally assigned.
+}
+
+// =============================================
+// DEBUG SERIAL COMMANDS
+// Compiled only when DEBUG_MODE = 1
+// =============================================
+#if DEBUG_MODE
+
+void printHelp() {
   Serial.println();
-  Serial.println("========== STATUS ==========");
-
-  Serial.print("Bluetooth: ");
-  Serial.println(
-    connected ? "CONNECTED" : "DISCONNECTED"
-  );
-
-  Serial.print("Auto calibration: ");
-  Serial.println(
-    autoCalibrate ? "ON" : "OFF"
-  );
-
-  Serial.print("Last action: ");
-  Serial.println(lastAction);
-
-  Serial.print("OLED: ");
-  Serial.print(displayLine1);
-  Serial.print(" / ");
-  Serial.println(displayLine2);
-
-  Serial.println("============================");
-
-  // OLED: show Bluetooth and calibration status
-  updateScreen(
-    connected ? "BLE Connected" : "BLE Waiting",
-    autoCalibrate ? "Auto Cal: ON" : "Auto Cal: OFF"
-  );
+  Serial.println("====== SCROLLER V3.8 ======");
+  Serial.println("s       -> UP SHORT");
+  Serial.println("d       -> UP LONG");
+  Serial.println("x       -> DOWN SHORT");
+  Serial.println("c       -> DOWN LONG");
+  Serial.println("r       -> LIKE");
+  Serial.println("status  -> OLED STATUS");
+  Serial.println("e       -> EDGE CAL");
+  Serial.println("cal     -> STANDARD CAL");
+  Serial.println("auto on -> ENABLE AUTO CAL");
+  Serial.println("auto off-> DISABLE AUTO CAL");
+  Serial.println("up 120 8");
+  Serial.println("down 180 10");
+  Serial.println("100,200 -> CURSOR MOVE");
+  Serial.println("help    -> COMMANDS");
+  Serial.println("===========================");
 }
 
-// ==========================================
-// SERIAL COMMAND PROCESSOR
-// ==========================================
 void processCommand(String input) {
   input.trim();
   input.toLowerCase();
 
   if (input.length() == 0) return;
 
-  Serial.print("[SERIAL] Received: ");
+  Serial.print("[SERIAL] ");
   Serial.println(input);
 
-  // Commands available without BLE
   if (input == "help") {
     printHelp();
     return;
@@ -530,56 +682,64 @@ void processCommand(String input) {
   if (input == "auto on") {
     autoCalibrate = true;
 
-    Serial.println("[AUTO CAL] Enabled");
-    updateScreen("Auto Cal", "Enabled");
+    Serial.println("[AUTO CAL] ON");
+
+    if (bleMouse.isConnected()) {
+      showAction(SCREEN_STATUS, "AUTO CAL ON");
+    }
     return;
   }
 
   if (input == "auto off") {
     autoCalibrate = false;
 
-    Serial.println("[AUTO CAL] Disabled");
-    updateScreen("Auto Cal", "Disabled");
+    Serial.println("[AUTO CAL] OFF");
+
+    if (bleMouse.isConnected()) {
+      showAction(SCREEN_STATUS, "AUTO CAL OFF");
+    }
     return;
   }
 
   if (!bleMouse.isConnected()) {
-    Serial.println("[ERROR] Connect Bluetooth first");
-    updateScreen("Bluetooth", "Waiting...");
+    Serial.println("[ERROR] BLE not connected");
+    drawScreen(SCREEN_SEARCHING);
     return;
   }
 
-  // Double-click
-  if (input == "r") {
-    simulateDoubleClick();
+  if (input == "s") {
+    simulateSwipe(100, 6, true,
+                  "SERIAL S", "UP SHORT");
   }
-
-  // Calibration
-  else if (input == "cal") {
-    calibrateStandard();
+  else if (input == "d") {
+    simulateSwipe(150, 12, true,
+                  "SERIAL D", "UP LONG");
+  }
+  else if (input == "x") {
+    simulateSwipe(100, 6, false,
+                  "SERIAL X", "DOWN SHORT");
+  }
+  else if (input == "c") {
+    simulateSwipe(150, 12, false,
+                  "SERIAL C", "DOWN LONG");
+  }
+  else if (input == "r") {
+    simulateDoubleClick();
   }
   else if (input == "e") {
     lastAction = "Edge calibration";
-    calibrateEdge();
-  }
 
-  // UP
-  else if (input == "s") {
-    simulateSwipe(100, 6, true, "SERIAL S");
+    if (calibrateEdge()) {
+      showAction(SCREEN_CALIBRATE);
+    }
   }
-  else if (input == "d") {
-    simulateSwipe(150, 12, true, "SERIAL D");
-  }
+  else if (input == "cal") {
+    lastAction = "Standard calibration";
 
-  // DOWN
-  else if (input == "x") {
-    simulateSwipe(100, 6, false, "SERIAL X");
+    if (calibrateStandard()) {
+      showAction(SCREEN_CALIBRATE);
+    }
   }
-  else if (input == "c") {
-    simulateSwipe(150, 12, false, "SERIAL C");
-  }
-
-  // Custom swipe
   else if (
     input.startsWith("up ") ||
     input.startsWith("down ")
@@ -615,57 +775,38 @@ void processCommand(String input) {
       );
     } else {
       Serial.println("[ERROR] Example: up 120 8");
+      showAction(SCREEN_ERROR);
     }
   }
-
-  // Manual cursor movement
   else if (input.indexOf(',') >= 0) {
     int x = 0;
     int y = 0;
 
-    int parsed = sscanf(
-      input.c_str(),
-      "%d,%d",
-      &x,
-      &y
-    );
-
-    if (parsed == 2) {
+    if (sscanf(input.c_str(), "%d,%d", &x, &y) == 2) {
       lastAction = "Move cursor";
 
-      Serial.print("[MOVE] X=");
-      Serial.print(x);
-      Serial.print(" Y=");
-      Serial.println(y);
-
-      updateScreen("Moving", "Cursor");
+      drawScreen(SCREEN_MOVE);
 
       if (moveCursor(x, y)) {
-        updateScreen("Cursor", "Moved");
-      } else {
-        updateScreen("Cursor", "Failed");
+        showAction(SCREEN_MOVE);
       }
     } else {
       Serial.println("[ERROR] Invalid coordinates");
+      showAction(SCREEN_ERROR);
     }
   }
-
   else {
     Serial.println("[ERROR] Unknown command");
-    updateScreen("Unknown", "Command");
+    showAction(SCREEN_ERROR);
   }
 }
 
-// ==========================================
-// SERIAL INPUT
-// ==========================================
 void executeSerialBuffer() {
   if (serialIndex == 0) return;
 
   serialBuffer[serialIndex] = '\0';
 
-  String input = String(serialBuffer);
-
+  String input(serialBuffer);
   serialIndex = 0;
 
   processCommand(input);
@@ -674,7 +815,6 @@ void executeSerialBuffer() {
 void handleSerial() {
   while (Serial.available() > 0) {
     char ch = Serial.read();
-
     lastSerialTime = millis();
 
     if (ch == '\n' || ch == '\r') {
@@ -696,23 +836,26 @@ void handleSerial() {
     }
   }
 
-  // Supports "No line ending"
+  // Also works with "No line ending"
   if (serialIndex > 0 &&
-      millis() - lastSerialTime >= SERIAL_TIMEOUT) {
+      millis() - lastSerialTime >= SERIAL_TIMEOUT_MS) {
     executeSerialBuffer();
   }
 
   if (serialOverflow &&
-      millis() - lastSerialTime >= SERIAL_TIMEOUT) {
+      millis() - lastSerialTime >= SERIAL_TIMEOUT_MS) {
     serialOverflow = false;
     serialIndex = 0;
   }
 }
 
-// ==========================================
+#endif
+
+// =============================================
 // SETUP
-// ==========================================
+// =============================================
 void setup() {
+#if DEBUG_MODE
   Serial.begin(115200);
 
   unsigned long startWait = millis();
@@ -721,83 +864,69 @@ void setup() {
          millis() - startWait < 3000) {
     delay(10);
   }
+#endif
 
-  // LED
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LED_OFF);
-  lastBlink = millis();
+  digitalWrite(LED_PIN, HIGH);
 
-  // Buttons
-  for (int i = 0; i < BUTTON_COUNT; i++) {
-    pinMode(buttons[i].pin, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_LIKE, INPUT_PULLUP);
+  pinMode(BTN_RESERVED, INPUT_PULLUP);
 
-    bool state = digitalRead(buttons[i].pin);
+  syncButton(downButton);
+  syncButton(upButton);
+  syncButton(likeButton);
+  syncButton(reservedButton);
 
-    buttons[i].lastRaw = state;
-    buttons[i].stableState = state;
-    buttons[i].lastChange = millis();
-  }
-
-  // OLED
   u8g2.begin();
-  updateScreen("Starting", "Scroller");
+  drawScreen(SCREEN_SEARCHING);
 
-  // Bluetooth
   bleMouse.begin();
 
+#if DEBUG_MODE
   Serial.println();
-  Serial.println("ESP32-C3 SCROLLER V3.6 STARTED");
-
+  Serial.println("ESP32-C3 SCROLLER V3.8");
+  Serial.println("DEBUG MODE: ON");
   printHelp();
-
-  updateScreen("Bluetooth", "Waiting...");
+#endif
 }
 
-// ==========================================
-// MAIN LOOP
-// ==========================================
+// =============================================
+// LOOP
+// =============================================
 void loop() {
   bool connected = bleMouse.isConnected();
 
-  // LED: blink while disconnected, off when connected
   updateLED();
 
-  // Bluetooth connection changes
   if (connected != wasConnected) {
     wasConnected = connected;
 
     if (connected) {
-      digitalWrite(LED_PIN, LED_OFF);
-      ledState = false;
+      DEBUG_PRINTLN("[BLE] Connected");
 
-      Serial.println("[BLE] Connected");
-      updateScreen("Bluetooth", "Connected!");
-    }
-    else {
-      Serial.println("[BLE] Disconnected");
+      actionScreenActive = false;
+      drawScreen(SCREEN_READY);
+    } else {
+      DEBUG_PRINTLN("[BLE] Disconnected");
 
-      ledState = true;
-      digitalWrite(LED_PIN, LED_ON);
-      lastBlink = millis();
-
-      updateScreen("Bluetooth", "Waiting...");
+      actionScreenActive = false;
+      drawScreen(SCREEN_SEARCHING);
     }
 
-    // Synchronize button states
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      bool state = digitalRead(buttons[i].pin);
-
-      buttons[i].lastRaw = state;
-      buttons[i].stableState = state;
-      buttons[i].lastChange = millis();
-    }
+    syncButton(downButton);
+    syncButton(upButton);
+    syncButton(likeButton);
+    syncButton(reservedButton);
   }
 
-  // Serial commands
+#if DEBUG_MODE
   handleSerial();
+#endif
 
-  // Physical buttons
   handleButtons();
+  updateDisplay();
 
   delay(1);
 }

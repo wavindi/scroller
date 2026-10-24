@@ -1,14 +1,15 @@
 
+#include <Arduino.h>
 #include <BleMouse.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <math.h>
 
 // =============================================
-// ESP32-C3 SCROLLER V4.2 - PRODUCTION
+// ESP32-C3 SCROLLER V4.5 - PRODUCTION
+// P / ESCAPE: PREMOVE DOWN 500 UNITS
 // =============================================
 
-// PRODUCTION: Serial Monitor completely disabled
 #define DEBUG_MODE 0
 
 #if DEBUG_MODE
@@ -19,20 +20,71 @@
   #define DBGLN(x) do {} while (0)
 #endif
 
-// OLED - confirmed working configuration
-// SCL = GPIO6, SDA = GPIO5
+// =============================================
+// TYPES
+// Keep before function prototypes
+// =============================================
+
+enum GestureType {
+  G_UP_SHORT,
+  G_UP_LONG,
+  G_DOWN_SHORT,
+  G_DOWN_LONG,
+  G_ESCAPE,
+  G_LIKE,
+  G_CALIBRATE
+};
+
+enum EngineState {
+  ENGINE_IDLE,
+  ENGINE_ESCAPE_PREMOVE,
+  ENGINE_ESCAPE_PAUSE,
+  ENGINE_PRESS,
+  ENGINE_PRESS_WAIT,
+  ENGINE_DRAG,
+  ENGINE_RELEASE_WAIT,
+  ENGINE_POST_RELEASE,
+  ENGINE_LIKE_PRESS_1,
+  ENGINE_LIKE_RELEASE_1,
+  ENGINE_LIKE_GAP,
+  ENGINE_LIKE_PRESS_2,
+  ENGINE_LIKE_RELEASE_2,
+  ENGINE_LIKE_POST_RELEASE,
+  ENGINE_CAL_MOVE_CORNER,
+  ENGINE_CAL_PAUSE,
+  ENGINE_CAL_MOVE_UP,
+  ENGINE_DONE
+};
+
+struct Button {
+  uint8_t pin;
+  bool raw;
+  bool stable;
+  uint32_t changedAt;
+  uint32_t pressedAt;
+  bool longFired;
+  bool pendingShort;
+};
+
+// Explicit prototypes prevent Arduino IDE type errors
+bool enqueueGesture(GestureType gesture);
+bool dequeueGesture(GestureType& gesture);
+void setEngineState(EngineState state, uint32_t now);
+void startGesture(GestureType gesture, uint32_t now);
+void syncButton(Button& b);
+void updateButton(Button& b, uint32_t now);
+
+// =============================================
+// HARDWARE
+// =============================================
+
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
   U8G2_R0, U8X8_PIN_NONE, 6, 5
 );
 
-// Bluetooth mouse
 BleMouse bleMouse("scroller", "Custom IoT", 100);
 
-// =============================================
-// GPIO PINS
-// =============================================
 const uint8_t LED_PIN = 8;
-
 const uint8_t PIN_UP = 3;
 const uint8_t PIN_DOWN = 4;
 const uint8_t PIN_ESCAPE = 10;
@@ -41,25 +93,28 @@ const uint8_t PIN_LIKE = 1;
 // =============================================
 // SETTINGS
 // =============================================
-const unsigned long DEBOUNCE_MS = 40;
-const unsigned long LONG_PRESS_MS = 500;
-const unsigned long COMBO_HOLD_MS = 300;
-const unsigned long COMBO_WINDOW_MS = 180;
-const unsigned long DISPLAY_MS = 2000;
-const unsigned long LED_BLINK_MS = 500;
+
+const uint32_t DEBOUNCE_MS = 40;
+const uint32_t LONG_PRESS_MS = 500;
+const uint32_t COMBO_HOLD_MS = 300;
+const uint32_t DISPLAY_MS = 2000;
+const uint32_t LED_BLINK_MS = 500;
 
 const int SHORT_DISTANCE = 100;
 const int LONG_DISTANCE = 150;
 
-const int SHORT_SPEED_MS = 6;
-const int LONG_SPEED_MS = 12;
+const uint32_t SHORT_SPEED_MS = 6;
+const uint32_t LONG_SPEED_MS = 12;
 
-// Fast ESCAPE gesture
-const int ESCAPE_PREMOVE_DOWN = 200;
+// P / ESCAPE SETTINGS
+// Changed from 200 to 500
+const int ESCAPE_PREMOVE_DOWN = 500;
 const int ESCAPE_DRAG_UP = 150;
-const int ESCAPE_SPEED_MS = 4;
+const uint32_t ESCAPE_SPEED_MS = 4;
 
-// OLED placement
+const uint32_t MOVE_INTERVAL_MS = 5;
+const uint8_t QUEUE_SIZE = 8;
+
 const int ICON_X = 64;
 const int ICON_Y = 39;
 const int TEXT_Y = 56;
@@ -67,11 +122,12 @@ const int TEXT_Y = 56;
 // =============================================
 // SYSTEM STATE
 // =============================================
+
 bool autoCalibrate = true;
 bool wasConnected = false;
-
 bool ledOn = false;
-unsigned long lastLedBlink = 0;
+
+uint32_t lastLedBlink = 0;
 
 enum ScreenType {
   SCREEN_SEARCHING,
@@ -85,54 +141,8 @@ enum ScreenType {
 };
 
 ScreenType currentScreen = SCREEN_SEARCHING;
-
 bool actionScreenActive = false;
-unsigned long actionFinishedAt = 0;
-
-// =============================================
-// BUTTON STATE
-// =============================================
-struct Button {
-  uint8_t pin;
-  bool raw;
-  bool stable;
-  unsigned long changedAt;
-  unsigned long pressedAt;
-  bool longFired;
-  bool pendingShort;
-};
-
-Button upBtn = {
-  PIN_UP, HIGH, HIGH, 0, 0, false, false
-};
-
-Button downBtn = {
-  PIN_DOWN, HIGH, HIGH, 0, 0, false, false
-};
-
-Button escapeBtn = {
-  PIN_ESCAPE, HIGH, HIGH, 0, 0, false, false
-};
-
-Button likeBtn = {
-  PIN_LIKE, HIGH, HIGH, 0, 0, false, false
-};
-
-Button* buttons[] = {
-  &upBtn,
-  &downBtn,
-  &escapeBtn,
-  &likeBtn
-};
-
-const int BUTTON_COUNT = 4;
-
-// Combination state
-bool comboCandidate = false;
-bool comboLatched = false;
-bool suppressUntilRelease = false;
-
-unsigned long allPressedAt = 0;
+uint32_t actionFinishedAt = 0;
 
 // =============================================
 // OLED ICONS
@@ -150,7 +160,6 @@ void iconSmile(int x, int y) {
   u8g2.drawCircle(x, y, 11);
   u8g2.drawDisc(x - 4, y - 3, 1);
   u8g2.drawDisc(x + 4, y - 3, 1);
-
   u8g2.drawLine(x - 5, y + 3, x - 2, y + 6);
   u8g2.drawLine(x - 2, y + 6, x + 2, y + 6);
   u8g2.drawLine(x + 2, y + 6, x + 5, y + 3);
@@ -159,7 +168,6 @@ void iconSmile(int x, int y) {
 void iconHeart(int x, int y) {
   u8g2.drawDisc(x - 5, y - 3, 5);
   u8g2.drawDisc(x + 5, y - 3, 5);
-
   u8g2.drawTriangle(
     x - 10, y - 1,
     x + 10, y - 1,
@@ -179,18 +187,14 @@ void iconDown(int x, int y) {
   u8g2.drawLine(x, y + 10, x + 8, y + 2);
 }
 
-// ESCAPE: Running person + exit arrow
+// Running person + exit arrow
 void iconEscape(int x, int y) {
   u8g2.drawDisc(x - 4, y - 9, 3);
-
   u8g2.drawLine(x - 4, y - 5, x + 2, y + 2);
-
   u8g2.drawLine(x - 2, y - 3, x + 6, y - 6);
   u8g2.drawLine(x - 2, y - 2, x - 10, y + 1);
-
   u8g2.drawLine(x + 2, y + 2, x + 9, y + 8);
   u8g2.drawLine(x + 2, y + 2, x - 7, y + 9);
-
   u8g2.drawLine(x + 11, y - 8, x + 18, y - 8);
   u8g2.drawLine(x + 18, y - 8, x + 14, y - 12);
   u8g2.drawLine(x + 18, y - 8, x + 14, y - 4);
@@ -281,7 +285,6 @@ void drawScreen(
   u8g2.setFont(u8g2_font_5x8_tf);
 
   int textWidth = u8g2.getStrWidth(label);
-
   int x = max(
     0,
     (u8g2.getDisplayWidth() - textWidth) / 2
@@ -296,12 +299,11 @@ void showAction(
   const char* label = nullptr
 ) {
   drawScreen(screen, label);
-
   actionScreenActive = true;
   actionFinishedAt = millis();
 }
 
-void updateDisplay() {
+void updateDisplay(uint32_t now) {
   if (!bleMouse.isConnected()) {
     actionScreenActive = false;
 
@@ -313,7 +315,7 @@ void updateDisplay() {
   }
 
   if (actionScreenActive &&
-      millis() - actionFinishedAt >= DISPLAY_MS) {
+      now - actionFinishedAt >= DISPLAY_MS) {
 
     actionScreenActive = false;
     drawScreen(SCREEN_READY);
@@ -321,222 +323,394 @@ void updateDisplay() {
 }
 
 // =============================================
-// STATUS LED
+// LED
 // =============================================
 
-void updateLED() {
+void updateLED(uint32_t now) {
   if (bleMouse.isConnected()) {
     ledOn = false;
     digitalWrite(LED_PIN, HIGH);
     return;
   }
 
-  if (millis() - lastLedBlink >= LED_BLINK_MS) {
-    lastLedBlink = millis();
+  if (now - lastLedBlink >= LED_BLINK_MS) {
+    lastLedBlink = now;
     ledOn = !ledOn;
-
-    // Active LOW LED
     digitalWrite(LED_PIN, ledOn ? LOW : HIGH);
   }
 }
 
 // =============================================
-// BLE CURSOR
+// GESTURE QUEUE
 // =============================================
 
-bool moveCursor(int x, int y) {
-  if (!bleMouse.isConnected()) return false;
+GestureType gestureQueue[QUEUE_SIZE];
 
-  while (x != 0 || y != 0) {
-    if (!bleMouse.isConnected()) return false;
+uint8_t queueHead = 0;
+uint8_t queueTail = 0;
+uint8_t queueCount = 0;
 
-    int dx = constrain(x, -127, 127);
-    int dy = constrain(y, -127, 127);
-
-    bleMouse.move(dx, dy);
-
-    x -= dx;
-    y -= dy;
-
-    delay(5);
+bool enqueueGesture(GestureType gesture) {
+  if (queueCount >= QUEUE_SIZE) {
+    return false;
   }
+
+  gestureQueue[queueTail] = gesture;
+  queueTail = (queueTail + 1) % QUEUE_SIZE;
+  queueCount++;
 
   return true;
 }
 
-// =============================================
-// EDGE CALIBRATION
-// =============================================
+bool dequeueGesture(GestureType& gesture) {
+  if (queueCount == 0) return false;
 
-bool calibrateEdge(bool displayIcon = true) {
-  if (!bleMouse.isConnected()) return false;
-
-  if (displayIcon) {
-    drawScreen(SCREEN_CAL);
-  }
-
-  if (!moveCursor(5000, 5000)) return false;
-
-  delay(100);
-
-  if (!moveCursor(0, -100)) return false;
-  if (!moveCursor(0, -70)) return false;
+  gesture = gestureQueue[queueHead];
+  queueHead = (queueHead + 1) % QUEUE_SIZE;
+  queueCount--;
 
   return true;
 }
 
+void clearQueue() {
+  queueHead = 0;
+  queueTail = 0;
+  queueCount = 0;
+}
+
 // =============================================
-// SWIPE
+// NON-BLOCKING ENGINE
 // =============================================
 
-void simulateSwipe(
-  int distance,
-  int speedDelay,
-  bool swipeUp,
-  const char* label
-) {
+EngineState engineState = ENGINE_IDLE;
+GestureType activeGesture = G_UP_SHORT;
+
+uint32_t stateStartedAt = 0;
+uint32_t lastMoveAt = 0;
+
+int remainingX = 0;
+int remainingY = 0;
+
+int dragRemaining = 0;
+int dragDirection = -1;
+uint32_t dragSpeed = SHORT_SPEED_MS;
+
+ScreenType activeScreen = SCREEN_READY;
+const char* activeLabel = "READY";
+
+bool mouseHeld = false;
+
+void setEngineState(EngineState state, uint32_t now) {
+  engineState = state;
+  stateStartedAt = now;
+}
+
+void setMovement(int x, int y, uint32_t now) {
+  remainingX = x;
+  remainingY = y;
+  lastMoveAt = now - MOVE_INTERVAL_MS;
+}
+
+bool tickMovement(uint32_t now) {
+  if (remainingX == 0 && remainingY == 0) {
+    return true;
+  }
+
+  if (now - lastMoveAt < MOVE_INTERVAL_MS) {
+    return false;
+  }
+
+  int dx = constrain(remainingX, -127, 127);
+  int dy = constrain(remainingY, -127, 127);
+
+  bleMouse.move(dx, dy);
+
+  remainingX -= dx;
+  remainingY -= dy;
+  lastMoveAt = now;
+
+  return remainingX == 0 && remainingY == 0;
+}
+
+void beginCalibration(uint32_t now) {
+  setMovement(5000, 5000, now);
+  setEngineState(ENGINE_CAL_MOVE_CORNER, now);
+}
+
+void finishGesture(uint32_t now) {
+  if (mouseHeld) {
+    bleMouse.release(MOUSE_LEFT);
+    mouseHeld = false;
+  }
+
+  if (autoCalibrate || activeGesture == G_CALIBRATE) {
+    beginCalibration(now);
+  } else {
+    setEngineState(ENGINE_DONE, now);
+  }
+}
+
+// =============================================
+// START GESTURE
+// =============================================
+
+void startGesture(GestureType gesture, uint32_t now) {
+  activeGesture = gesture;
+
+  switch (gesture) {
+    case G_UP_SHORT:
+      activeScreen = SCREEN_UP;
+      activeLabel = "UP SHORT";
+      dragRemaining = SHORT_DISTANCE;
+      dragDirection = -1;
+      dragSpeed = SHORT_SPEED_MS;
+      setEngineState(ENGINE_PRESS, now);
+      break;
+
+    case G_UP_LONG:
+      activeScreen = SCREEN_UP;
+      activeLabel = "UP LONG";
+      dragRemaining = LONG_DISTANCE;
+      dragDirection = -1;
+      dragSpeed = LONG_SPEED_MS;
+      setEngineState(ENGINE_PRESS, now);
+      break;
+
+    case G_DOWN_SHORT:
+      activeScreen = SCREEN_DOWN;
+      activeLabel = "DOWN SHORT";
+      dragRemaining = SHORT_DISTANCE;
+      dragDirection = 1;
+      dragSpeed = SHORT_SPEED_MS;
+      setEngineState(ENGINE_PRESS, now);
+      break;
+
+    case G_DOWN_LONG:
+      activeScreen = SCREEN_DOWN;
+      activeLabel = "DOWN LONG";
+      dragRemaining = LONG_DISTANCE;
+      dragDirection = 1;
+      dragSpeed = LONG_SPEED_MS;
+      setEngineState(ENGINE_PRESS, now);
+      break;
+
+    case G_ESCAPE:
+      activeScreen = SCREEN_ESCAPE;
+      activeLabel = "ESCAPE";
+      dragRemaining = ESCAPE_DRAG_UP;
+      dragDirection = -1;
+      dragSpeed = ESCAPE_SPEED_MS;
+
+      // NEW: Move DOWN 500 without clicking
+      setMovement(0, ESCAPE_PREMOVE_DOWN, now);
+      setEngineState(ENGINE_ESCAPE_PREMOVE, now);
+      break;
+
+    case G_LIKE:
+      activeScreen = SCREEN_LIKE;
+      activeLabel = "LIKE!";
+      setEngineState(ENGINE_LIKE_PRESS_1, now);
+      break;
+
+    case G_CALIBRATE:
+      activeScreen = SCREEN_CAL;
+      activeLabel = "CALIBRATE";
+      beginCalibration(now);
+      break;
+  }
+
+  drawScreen(activeScreen, activeLabel);
+  actionScreenActive = false;
+}
+
+// =============================================
+// ENGINE TICK
+// =============================================
+
+void tickEngine(uint32_t now) {
   if (!bleMouse.isConnected()) return;
 
-  if (distance < 1 || distance > 2000 ||
-      speedDelay < 1 || speedDelay > 100) {
+  if (engineState == ENGINE_IDLE) {
+    GestureType nextGesture;
 
-    showAction(SCREEN_ERROR);
+    if (dequeueGesture(nextGesture)) {
+      startGesture(nextGesture, now);
+    }
+
     return;
   }
 
-  ScreenType screen =
-    swipeUp ? SCREEN_UP : SCREEN_DOWN;
+  switch (engineState) {
 
-  drawScreen(screen, label);
+    // ESCAPE: Move DOWN 500 without clicking
+    case ENGINE_ESCAPE_PREMOVE:
+      if (tickMovement(now)) {
+        setEngineState(ENGINE_ESCAPE_PAUSE, now);
+      }
+      break;
 
-  // Press and hold left mouse button
-  bleMouse.press(MOUSE_LEFT);
-  delay(50);
+    case ENGINE_ESCAPE_PAUSE:
+      if (now - stateStartedAt >= 10) {
+        setEngineState(ENGINE_PRESS, now);
+      }
+      break;
 
-  // Drag
-  int remaining = distance;
+    case ENGINE_PRESS:
+      bleMouse.press(MOUSE_LEFT);
+      mouseHeld = true;
+      setEngineState(ENGINE_PRESS_WAIT, now);
+      break;
 
-  while (remaining > 0) {
-    if (!bleMouse.isConnected()) {
-      bleMouse.release(MOUSE_LEFT);
-      return;
+    case ENGINE_PRESS_WAIT: {
+      uint32_t waitMs =
+        (activeGesture == G_ESCAPE) ? 20 : 50;
+
+      if (now - stateStartedAt >= waitMs) {
+        lastMoveAt = now - dragSpeed;
+        setEngineState(ENGINE_DRAG, now);
+      }
+      break;
     }
 
-    int step = min(remaining, 10);
+    case ENGINE_DRAG:
+      if (now - lastMoveAt >= dragSpeed) {
+        int step = min(dragRemaining, 10);
 
-    bleMouse.move(
-      0,
-      swipeUp ? -step : step
-    );
+        if (step > 0) {
+          bleMouse.move(0, dragDirection * step);
+          dragRemaining -= step;
+          lastMoveAt = now;
+        }
 
-    remaining -= step;
-    delay(speedDelay);
-  }
+        if (dragRemaining <= 0) {
+          setEngineState(ENGINE_RELEASE_WAIT, now);
+        }
+      }
+      break;
 
-  // Release
-  delay(20);
-  bleMouse.release(MOUSE_LEFT);
-  delay(100);
+    case ENGINE_RELEASE_WAIT: {
+      uint32_t waitMs =
+        (activeGesture == G_ESCAPE) ? 5 : 20;
 
-  // Auto calibration
-  if (autoCalibrate && bleMouse.isConnected()) {
-    if (!calibrateEdge(false)) return;
-  }
-
-  if (bleMouse.isConnected()) {
-    showAction(screen, label);
-  }
-}
-
-// =============================================
-// FAST ESCAPE GESTURE
-// =============================================
-
-void performEscapeGesture() {
-  if (!bleMouse.isConnected()) return;
-
-  drawScreen(SCREEN_ESCAPE);
-
-  // 1. Move DOWN 200, no click
-  if (!moveCursor(0, ESCAPE_PREMOVE_DOWN)) return;
-
-  delay(10);
-
-  if (!bleMouse.isConnected()) return;
-
-  // 2. Press left mouse button
-  bleMouse.press(MOUSE_LEFT);
-  delay(20);
-
-  // 3. Drag UP 150 quickly
-  int remaining = ESCAPE_DRAG_UP;
-
-  while (remaining > 0) {
-    if (!bleMouse.isConnected()) {
-      bleMouse.release(MOUSE_LEFT);
-      return;
+      if (now - stateStartedAt >= waitMs) {
+        bleMouse.release(MOUSE_LEFT);
+        mouseHeld = false;
+        setEngineState(ENGINE_POST_RELEASE, now);
+      }
+      break;
     }
 
-    int step = min(remaining, 10);
+    case ENGINE_POST_RELEASE: {
+      uint32_t waitMs =
+        (activeGesture == G_ESCAPE) ? 20 : 100;
 
-    bleMouse.move(0, -step);
+      if (now - stateStartedAt >= waitMs) {
+        finishGesture(now);
+      }
+      break;
+    }
 
-    remaining -= step;
-    delay(ESCAPE_SPEED_MS);
-  }
+    case ENGINE_LIKE_PRESS_1:
+      bleMouse.press(MOUSE_LEFT);
+      mouseHeld = true;
+      setEngineState(ENGINE_LIKE_RELEASE_1, now);
+      break;
 
-  // 4. Release
-  delay(5);
-  bleMouse.release(MOUSE_LEFT);
-  delay(20);
+    case ENGINE_LIKE_RELEASE_1:
+      if (now - stateStartedAt >= 50) {
+        bleMouse.release(MOUSE_LEFT);
+        mouseHeld = false;
+        setEngineState(ENGINE_LIKE_GAP, now);
+      }
+      break;
 
-  // 5. Auto calibration
-  if (autoCalibrate && bleMouse.isConnected()) {
-    if (!calibrateEdge(false)) return;
-  }
+    case ENGINE_LIKE_GAP:
+      if (now - stateStartedAt >= 100) {
+        setEngineState(ENGINE_LIKE_PRESS_2, now);
+      }
+      break;
 
-  if (bleMouse.isConnected()) {
-    showAction(SCREEN_ESCAPE);
+    case ENGINE_LIKE_PRESS_2:
+      bleMouse.press(MOUSE_LEFT);
+      mouseHeld = true;
+      setEngineState(ENGINE_LIKE_RELEASE_2, now);
+      break;
+
+    case ENGINE_LIKE_RELEASE_2:
+      if (now - stateStartedAt >= 50) {
+        bleMouse.release(MOUSE_LEFT);
+        mouseHeld = false;
+        setEngineState(ENGINE_LIKE_POST_RELEASE, now);
+      }
+      break;
+
+    case ENGINE_LIKE_POST_RELEASE:
+      if (now - stateStartedAt >= 100) {
+        finishGesture(now);
+      }
+      break;
+
+    case ENGINE_CAL_MOVE_CORNER:
+      if (tickMovement(now)) {
+        setEngineState(ENGINE_CAL_PAUSE, now);
+      }
+      break;
+
+    case ENGINE_CAL_PAUSE:
+      if (now - stateStartedAt >= 100) {
+        setMovement(0, -170, now);
+        setEngineState(ENGINE_CAL_MOVE_UP, now);
+      }
+      break;
+
+    case ENGINE_CAL_MOVE_UP:
+      if (tickMovement(now)) {
+        setEngineState(ENGINE_DONE, now);
+      }
+      break;
+
+    case ENGINE_DONE:
+      showAction(activeScreen, activeLabel);
+      setEngineState(ENGINE_IDLE, now);
+      break;
+
+    default:
+      break;
   }
 }
 
 // =============================================
-// DOUBLE CLICK / LIKE
+// BUTTONS
 // =============================================
 
-void simulateDoubleClick() {
-  if (!bleMouse.isConnected()) return;
+Button upBtn = {
+  PIN_UP, HIGH, HIGH, 0, 0, false, false
+};
 
-  drawScreen(SCREEN_LIKE);
+Button downBtn = {
+  PIN_DOWN, HIGH, HIGH, 0, 0, false, false
+};
 
-  // First click
-  bleMouse.press(MOUSE_LEFT);
-  delay(50);
-  bleMouse.release(MOUSE_LEFT);
+Button escapeBtn = {
+  PIN_ESCAPE, HIGH, HIGH, 0, 0, false, false
+};
 
-  delay(100);
+Button likeBtn = {
+  PIN_LIKE, HIGH, HIGH, 0, 0, false, false
+};
 
-  if (!bleMouse.isConnected()) return;
+Button* buttons[] = {
+  &upBtn,
+  &downBtn,
+  &escapeBtn,
+  &likeBtn
+};
 
-  // Second click
-  bleMouse.press(MOUSE_LEFT);
-  delay(50);
-  bleMouse.release(MOUSE_LEFT);
+const int BUTTON_COUNT = 4;
 
-  delay(100);
-
-  if (autoCalibrate && bleMouse.isConnected()) {
-    if (!calibrateEdge(false)) return;
-  }
-
-  if (bleMouse.isConnected()) {
-    showAction(SCREEN_LIKE);
-  }
-}
-
-// =============================================
-// BUTTON INPUT
-// =============================================
+bool comboCandidate = false;
+bool suppressUntilRelease = false;
+uint32_t allPressedAt = 0;
 
 void syncButton(Button& b) {
   bool state = digitalRead(b.pin);
@@ -549,8 +723,7 @@ void syncButton(Button& b) {
   b.pendingShort = false;
 }
 
-void updateButton(Button& b) {
-  unsigned long now = millis();
+void updateButton(Button& b, uint32_t now) {
   bool reading = digitalRead(b.pin);
 
   if (reading != b.raw) {
@@ -598,11 +771,9 @@ void clearPendingActions() {
   }
 }
 
-void handleButtons() {
-  unsigned long now = millis();
-
+void handleButtons(uint32_t now) {
   for (int i = 0; i < BUTTON_COUNT; i++) {
-    updateButton(*buttons[i]);
+    updateButton(*buttons[i], now);
   }
 
   if (!bleMouse.isConnected()) return;
@@ -610,123 +781,70 @@ void handleButtons() {
   bool anyPressed = anyButtonPressed();
   bool allPressed = allButtonsPressed();
 
-  // Ignore button releases after combo
   if (suppressUntilRelease) {
     clearPendingActions();
 
     if (!anyPressed) {
       suppressUntilRelease = false;
-      comboLatched = false;
     }
 
     return;
   }
 
-  // All four held -> edge calibration
   if (allPressed) {
     if (!comboCandidate) {
       comboCandidate = true;
       allPressedAt = now;
     }
 
-    if (!comboLatched &&
-        now - allPressedAt >= COMBO_HOLD_MS) {
-
-      comboLatched = true;
-      suppressUntilRelease = true;
-
+    if (now - allPressedAt >= COMBO_HOLD_MS) {
       clearPendingActions();
-
-      if (calibrateEdge()) {
-        showAction(SCREEN_CAL);
-      }
-
-      return;
+      suppressUntilRelease = true;
+      comboCandidate = false;
+      enqueueGesture(G_CALIBRATE);
     }
-  } else {
-    comboCandidate = false;
+
+    return;
   }
 
-  // Don't execute actions while all four
-  // buttons are held
-  if (allPressed || comboCandidate) return;
+  comboCandidate = false;
 
-  // Long UP
   if (upBtn.stable == LOW &&
       !upBtn.longFired &&
       now - upBtn.pressedAt >= LONG_PRESS_MS) {
 
     upBtn.longFired = true;
     upBtn.pendingShort = false;
-
-    simulateSwipe(
-      LONG_DISTANCE,
-      LONG_SPEED_MS,
-      true,
-      "UP LONG"
-    );
-
-    return;
+    enqueueGesture(G_UP_LONG);
   }
 
-  // Long DOWN
   if (downBtn.stable == LOW &&
       !downBtn.longFired &&
       now - downBtn.pressedAt >= LONG_PRESS_MS) {
 
     downBtn.longFired = true;
     downBtn.pendingShort = false;
-
-    simulateSwipe(
-      LONG_DISTANCE,
-      LONG_SPEED_MS,
-      false,
-      "DOWN LONG"
-    );
-
-    return;
+    enqueueGesture(G_DOWN_LONG);
   }
 
-  // Short UP
   if (upBtn.pendingShort) {
     upBtn.pendingShort = false;
-
-    simulateSwipe(
-      SHORT_DISTANCE,
-      SHORT_SPEED_MS,
-      true,
-      "UP SHORT"
-    );
-
-    return;
+    enqueueGesture(G_UP_SHORT);
   }
 
-  // Short DOWN
   if (downBtn.pendingShort) {
     downBtn.pendingShort = false;
-
-    simulateSwipe(
-      SHORT_DISTANCE,
-      SHORT_SPEED_MS,
-      false,
-      "DOWN SHORT"
-    );
-
-    return;
+    enqueueGesture(G_DOWN_SHORT);
   }
 
-  // GPIO10 -> ESCAPE
   if (escapeBtn.pendingShort) {
     escapeBtn.pendingShort = false;
-    performEscapeGesture();
-    return;
+    enqueueGesture(G_ESCAPE);
   }
 
-  // GPIO1 -> LIKE
   if (likeBtn.pendingShort) {
     likeBtn.pendingShort = false;
-    simulateDoubleClick();
-    return;
+    enqueueGesture(G_LIKE);
   }
 }
 
@@ -737,7 +855,6 @@ void handleButtons() {
 void setup() {
 #if DEBUG_MODE
   Serial.begin(115200);
-  DBGLN("ESP32-C3 SCROLLER V4.2");
 #endif
 
   pinMode(LED_PIN, OUTPUT);
@@ -763,31 +880,40 @@ void setup() {
 // =============================================
 
 void loop() {
+  uint32_t now = millis();
   bool connected = bleMouse.isConnected();
 
-  updateLED();
+  updateLED(now);
 
   if (connected != wasConnected) {
     wasConnected = connected;
     actionScreenActive = false;
+
+    if (mouseHeld) {
+      bleMouse.release(MOUSE_LEFT);
+      mouseHeld = false;
+    }
+
+    engineState = ENGINE_IDLE;
+    clearQueue();
+
+    comboCandidate = false;
+    suppressUntilRelease = false;
+
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+      syncButton(*buttons[i]);
+    }
 
     if (connected) {
       drawScreen(SCREEN_READY);
     } else {
       drawScreen(SCREEN_SEARCHING);
     }
-
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      syncButton(*buttons[i]);
-    }
-
-    comboCandidate = false;
-    comboLatched = false;
-    suppressUntilRelease = false;
   }
 
-  handleButtons();
-  updateDisplay();
+  handleButtons(now);
+  tickEngine(now);
+  updateDisplay(now);
 
   delay(1);
 }
